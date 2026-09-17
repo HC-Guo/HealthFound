@@ -1,8 +1,7 @@
 # HealthFound Open-Source Training Pipeline
 
-This directory contains a de-identified, three-stage training pipeline template for HealthFound-style model development.
+Three-stage training pipeline template for HealthFound model development.
 
-The original internal scripts were converted into public-safe templates. Concrete local paths, private dataset names, private output names, API tokens, and internal cache directories are intentionally removed. Before running, replace placeholders or export the required environment variables in your own environment.
 ## Quick Start
 
 ```python
