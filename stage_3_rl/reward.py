@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""De-identified reward function used by the Stage-3 GRPO template.
-
-This is a faithful public-safe rewrite of the internal reward logic:
-- binary risk prediction reward with answer/thinking consistency
-- multiple-choice reasoning reward
-- masked value reward for codes, dates, numeric points, and numeric ranges
-- open QA reward using lightweight lexical overlap metrics
-
-Private data-source names are intentionally replaced with generic aliases. If
-your released parquet files use different ``data_source`` values, either set
-``extra_info["task_type"]`` or extend ``TASK_ALIASES`` below in your private
-training copy.
-"""
-
 from __future__ import annotations
 
 import math
@@ -186,52 +171,72 @@ def extract_think_and_answer(solution_str: str) -> Tuple[Optional[str], Optional
     return think_content, answer_content
 
 
-def extract_prediction(response: str) -> str:
-    if not response:
+def _extract_final_answer(text):
+    """Return the final-answer payload without searching reasoning for answers."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    closing = list(re.finditer(r"</think\s*>", text, re.IGNORECASE))
+    if closing:
+        text = text[closing[-1].end():].strip()
+    if re.search(r"</?think\b", text, re.IGNORECASE):
+        return None
+
+    if re.search(r"</?answer\b", text, re.IGNORECASE):
+        fields = re.findall(r"<answer\s*>(.*?)</answer\s*>", text, re.IGNORECASE | re.DOTALL)
+        opens = re.findall(r"<answer\s*>", text, re.IGNORECASE)
+        closes = re.findall(r"</answer\s*>", text, re.IGNORECASE)
+        if len(fields) != 1 or len(opens) != 1 or len(closes) != 1:
+            return None
+        text = fields[0].strip()
+
+    markers = list(re.finditer(r"\[Prediction\]\s*:", text, re.IGNORECASE))
+    if markers:
+        text = text[markers[-1].end():].strip()
+        text = re.split(r"\n\s*\[[A-Za-z][^\]\n]*\]\s*:", text, maxsplit=1)[0].strip()
+
+    box_start = r"(?:\\+boxed|<boxed\b|\[boxed\{)"
+    starts = re.findall(box_start, text, re.IGNORECASE)
+    if starts:
+        boxes = list(re.finditer(
+            r"\\+boxed\s*\{([^{}]*)\}|<boxed\s*>([^<>]*)</boxed\s*>|\[boxed\{([^{}]*)\}\]",
+            text, re.IGNORECASE | re.DOTALL,
+        ))
+        if len(boxes) != len(starts):
+            return None
+        text = next(value for value in boxes[-1].groups() if value is not None).strip()
+    else:
+        marker = re.search(r"(?:final\s+answer|answer)\s*:\s*", text, re.IGNORECASE)
+        if marker:
+            text = text[marker.end():].strip()
+
+    if re.search(r"</?think\b", text, re.IGNORECASE):
+        return None
+    return text or None
+
+
+def extract_prediction(response):
+    """Return 'yes', 'no', or 'unk' from an explicit final prediction."""
+    answer = _extract_final_answer(response)
+    if answer is None:
         return "unk"
-
-    patterns = [
-        r"\\\\?boxed\{(Yes|No|YES|NO|yes|no)\}",
-        r"\\boxed\{(Yes|No|YES|NO|yes|no)\}",
-        r"\\boxed\s*\{(Yes|No|YES|NO|yes|no)\}",
-        r"\[boxed\{(Yes|No|YES|NO|yes|no)\}\]",
-        r"<boxed>(Yes|No|YES|NO|yes|no)</boxed>",
-    ]
-    for pattern in patterns:
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            last_match = matches[-1].lower()
-            if "yes" in last_match:
-                return "yes"
-            if "no" in last_match:
-                return "no"
-
-    response_lower = response.lower()
-    yes_terms = ["yes", "high risk", "high", "positive"]
-    no_terms = ["no", "low risk", "low", "negative"]
-    has_yes = any(keyword in response_lower for keyword in yes_terms)
-    has_no = any(keyword in response_lower for keyword in no_terms)
-
-    recent_context = response_lower[-200:] if len(response) > 200 else response_lower
-    recent_has_yes = any(keyword in recent_context for keyword in yes_terms)
-    recent_has_no = any(keyword in recent_context for keyword in no_terms)
-
-    if recent_has_yes and not recent_has_no:
-        return "yes"
-    if recent_has_no and not recent_has_yes:
-        return "no"
-    if has_yes and not has_no:
-        return "yes"
-    if has_no and not has_yes:
-        return "no"
+    answer = answer.strip().strip("* \t\r\n").rstrip(".!。！").strip().lower()
+    aliases = {
+        "yes": "yes", "high risk": "yes", "high-risk": "yes", "positive": "yes",
+        "no": "no", "low risk": "no", "low-risk": "no", "negative": "no",
+    }
+    if answer in aliases:
+        return aliases[answer]
+    match = re.fullmatch(
+        r"(?:the\s+)?subject\s+is\s+at\s+(?:a\s+)?(high|low)\s+risk\s+of\s+developing\s+[^\n]+",
+        answer,
+    )
+    if match:
+        return "yes" if match.group(1) == "high" else "no"
     return "unk"
 
 
-def compute_score_binary_risk(
-    solution_str: str,
-    ground_truth: str,
-    weights: Optional[Dict[str, float]] = None,
-) -> float:
+def compute_score_binary_risk(solution_str, ground_truth, weights=None):
     if weights is None:
         weights = {
             "answer_accuracy": 0.8,
@@ -239,39 +244,38 @@ def compute_score_binary_risk(
             "think_answer_consistency": 0.1,
         }
 
-    true_risk = ground_truth
-    think_content, answer_content = extract_think_and_answer(solution_str)
-
+    true_risk = extract_prediction(ground_truth)
+    if true_risk not in {"yes", "no"}:
+        raise ValueError("Invalid ground-truth binary-risk label")
     if not solution_str:
         return 0.0
 
-    if not answer_content:
-        answer_risk_accuracy = 0.0
+    closing = list(re.finditer(r"</think\s*>", solution_str, re.IGNORECASE))
+    think_content = None
+    if closing:
+        think_content = re.sub(
+            r"</?think\s*>", "", solution_str[:closing[-1].start()], flags=re.IGNORECASE,
+        ).strip()
+    answer_prediction = extract_prediction(solution_str)
+    if answer_prediction not in {"yes", "no"}:
+        return 0.0
+    think_prediction = extract_prediction(think_content)
+
+    if answer_prediction == true_risk:
+        answer_accuracy = 1.0
+    elif true_risk == "yes" and answer_prediction == "no":
+        answer_accuracy = -0.1  # Preserve the original false-low penalty.
     else:
-        answer_prediction = extract_prediction(answer_content)
-        if true_risk.lower() in answer_prediction:
-            answer_risk_accuracy = 1.0
-        elif "yes" in true_risk.lower() and true_risk.lower() not in answer_prediction:
-            answer_risk_accuracy = -0.1
-        else:
-            answer_risk_accuracy = 0.0
-
-    answer_accuracy_score = answer_risk_accuracy
-
-    if not think_content:
-        think_risk_accuracy = 0.0
-    else:
-        think_risk_accuracy = 1.0 if true_risk.lower() in extract_prediction(think_content) else 0.0
-
-    think_accuracy_score = think_risk_accuracy
-    think_answer_consistency_score = 1.0 if answer_risk_accuracy == think_risk_accuracy else 0.0
-
-    total_score = (
-        weights["answer_accuracy"] * answer_accuracy_score
-        + weights["think_accuracy"] * think_accuracy_score
-        + weights["think_answer_consistency"] * think_answer_consistency_score
+        answer_accuracy = 0.0
+    think_accuracy = float(think_prediction in {"yes", "no"} and think_prediction == true_risk)
+    consistency = float(
+        think_prediction in {"yes", "no"} and think_prediction == answer_prediction
     )
-    return float(total_score)
+    return float(
+        weights["answer_accuracy"] * answer_accuracy
+        + weights["think_accuracy"] * think_accuracy
+        + weights["think_answer_consistency"] * consistency
+    )
 
 
 def parse_date_to_float(text: str) -> Optional[float]:
@@ -386,18 +390,21 @@ def extract_value_hybrid(text: str) -> Tuple[Optional[Any], Optional[str]]:
     return None, None
 
 
-def compute_score_masked_value(solution_str: str, ground_truth: str) -> float:
+def compute_score_masked_value(solution_str, ground_truth):
     if not solution_str or not ground_truth:
         return 0.0
 
-    pred_val, pred_type = extract_value_hybrid(solution_str)
-    gt_val, gt_type = extract_value_hybrid(ground_truth)
+    final_answer = _extract_final_answer(solution_str)
+    final_target = _extract_final_answer(ground_truth)
+    if final_answer is None or final_target is None:
+        return 0.0
+    pred_val, pred_type = extract_value_hybrid(final_answer)
+    gt_val, gt_type = extract_value_hybrid(final_target)
     if pred_val is None or gt_val is None:
         return 0.0
 
     correct = False
     iou_threshold = 0.5
-
     if gt_type == "code" or pred_type == "code":
         pred_str = str(pred_val).upper()
         gt_str = str(gt_val).upper()
@@ -411,25 +418,15 @@ def compute_score_masked_value(solution_str: str, ground_truth: str) -> float:
         elif gt_type == "point":
             value = float(gt_val)
             if value > 1800:
-                tolerance = 0.5
-                gt_min = value - tolerance
-                gt_max = value + tolerance
+                gt_min, gt_max = value - 0.5, value + 0.5
             else:
-                gt_min = value * 0.95
-                gt_max = value * 1.05
-                if gt_min > gt_max:
-                    gt_min, gt_max = gt_max, gt_min
+                gt_min, gt_max = sorted((value * 0.95, value * 1.05))
         else:
             return 0.0
-
         if pred_type == "point":
-            if gt_min <= float(pred_val) <= gt_max:
-                correct = True
+            correct = gt_min <= float(pred_val) <= gt_max
         elif pred_type == "range":
-            iou = calculate_iou((gt_min, gt_max), pred_val)
-            if iou >= iou_threshold:
-                correct = True
-
+            correct = calculate_iou((gt_min, gt_max), pred_val) >= iou_threshold
     return 1.0 if correct else 0.0
 
 
@@ -544,7 +541,7 @@ def compute_score_open_qa(solution_str: str, ground_truth: str) -> float:
     return max(0.0, min(1.0, reward))
 
 
-# Backward-readable function names for users adapting the public template.
+
 compute_score_risk_prediction = compute_score_binary_risk
 compute_score_multiple_choice = compute_score_choice_reasoning
 compute_score_structured_value = compute_score_masked_value
