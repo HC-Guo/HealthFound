@@ -11,9 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-The main entry point to run the PPO algorithm
-"""
+
 
 import asyncio
 import datetime
@@ -788,7 +786,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
-    def update_actor(self, data: DataProto):
+    def update_actor(self, data: DataProto, anchor_data: DataProto = None):
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -797,15 +795,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
+            if anchor_data is not None:
+                # A separate DataProto may have a different batch size from RL;
+                # the actor dispatch splits both over the same DP ranks.
+                anchor_data = anchor_data.to("cpu")
 
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+                metrics = self.actor.update_policy(data=data, anchor_data=anchor_data)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            anchor_flops = 0.0
+            if anchor_data is not None:
+                # The anchor stream already contains one batch for EVERY update,
+                # including PPO epochs; do not multiply its FLOPs by epochs again.
+                anchor_flops, _ = self.flops_counter.estimate_flops(
+                    anchor_data.meta_info["global_token_num"], delta_time
+                )
             metrics["perf/mfu/actor"] = (
-                estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+                (estimated_flops * self.config.actor.ppo_epochs + anchor_flops) / promised_flops / self.world_size
             )
             metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
             metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
