@@ -13,9 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Single Process Actor
-"""
 
 import logging
 import os
@@ -29,6 +26,7 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+from verl.utils.hfpo_retention import retention_loss
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -360,7 +358,7 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def update_policy(self, data: DataProto):
+    def update_policy(self, data: DataProto, anchor_data: DataProto = None):
         # make sure we are in training mode
         self.actor_module.train()
 
@@ -394,6 +392,17 @@ class DataParallelPPOActor(BasePPOActor):
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
+        retention_coef = self.config.get("retention_loss_coef", 0.0)
+        anchor_batches = None
+        if retention_coef > 0:
+            num_updates = len(mini_batches) * self.config.ppo_epochs
+            if anchor_data is None or len(anchor_data) < num_updates or len(anchor_data) % num_updates:
+                raise ValueError("HFPO requires equal nonempty anchor batches for every actor optimizer update")
+            anchor_batches = anchor_data.split(len(anchor_data) // num_updates)
+        elif anchor_data is not None:
+            raise ValueError("Anchor data supplied while retention_loss_coef is zero")
+        update_index = 0
+
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
@@ -409,6 +418,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                total_loss_value = 0.0
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -481,6 +491,7 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss = policy_loss * loss_scale_factor
                     loss.backward()
+                    total_loss_value += loss.detach().item()
 
                     micro_batch_metrics.update(
                         {
@@ -492,8 +503,35 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
+                # Both losses accumulate gradients on the same actor before ONE
+                # optimizer step. The anchor batch is independent of rollout.n.
+                if anchor_batches is not None:
+                    anchor_batch = anchor_batches[update_index]
+                    retention_value = 0.0
+                    for anchor_micro_batch in anchor_batch.split(self.config.retention_micro_batch_size_per_gpu):
+                        anchor_micro_batch = anchor_micro_batch.to(get_device_id())
+                        _, anchor_log_probs = self._forward_micro_batch(
+                            dict(anchor_micro_batch.batch), temperature=1.0, calculate_entropy=False
+                        )
+                        anchor_loss = retention_loss(anchor_log_probs, anchor_micro_batch.batch["response_mask"])
+                        # Average samples, rather than tokens or microbatches;
+                        # this also handles an incomplete final microbatch.
+                        anchor_scale = len(anchor_micro_batch) / len(anchor_batch)
+                        (retention_coef * anchor_scale * anchor_loss).backward()
+                        retention_value += anchor_scale * anchor_loss.detach().item()
+                    total_loss_value += retention_coef * retention_value
+                    append_to_dict(metrics, {
+                        "actor/retention_loss": retention_value,
+                        "actor/retention_loss_weighted": retention_coef * retention_value,
+                        "actor/retention_coef": retention_coef,
+                        "actor/retention_samples_per_rank": len(anchor_batch),
+                    })
+                update_index += 1
                 grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                mini_batch_metrics = {
+                    "actor/grad_norm": grad_norm.detach().item(),
+                    "actor/total_loss": total_loss_value,
+                }
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics
