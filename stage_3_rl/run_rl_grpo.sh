@@ -72,8 +72,8 @@ if [[ "${RANK}" == "0" ]]; then
     -m
     verl.trainer.main_ppo
     algorithm.adv_estimator=grpo
-    reward.custom_reward_function.path="${REWARD_FUNCTION_PATH}"
-    reward.custom_reward_function.name="${REWARD_FUNCTION_NAME}"
+    custom_reward_function.path="${REWARD_FUNCTION_PATH}"
+    custom_reward_function.name="${REWARD_FUNCTION_NAME}"
     data.train_files="${TRAIN_FILES_JSON}"
     data.val_files="${VAL_FILES_JSON}"
     data.train_batch_size="${TRAIN_BATCH_SIZE:-256}"
