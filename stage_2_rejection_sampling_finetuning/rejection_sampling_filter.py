@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""Rejection-sampling data builder for instruction-tuning records.
-
-The script generates multiple completions for each input sample, keeps completions
-whose parsed prediction matches the ground truth, and optionally filters near-
-duplicate completions with a simple Jaccard similarity check.
-
-No dataset-specific paths or private names are embedded in this file. Adapt the
-label and prediction parsers if your task is not binary risk prediction.
-"""
-
 import argparse
 import json
 import os
@@ -17,35 +6,22 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 from vllm import LLM, SamplingParams
+import importlib.util
 
+_reward_path = (
+    Path(__file__).resolve().parents[1]
+    / "stage_3_rl"
+    / "reward.py"
+)
+_reward_spec = importlib.util.spec_from_file_location(
+    "_healthfound_reward", _reward_path
+)
+_reward = importlib.util.module_from_spec(_reward_spec)
+_reward_spec.loader.exec_module(_reward)
 
 def extract_prediction(response: str) -> Optional[int]:
-    """Parse a binary prediction from a model response.
-
-    Returns:
-        1 for positive or high risk, 0 for negative or low risk, None if parsing
-        fails.
-    """
-    if not response:
-        return None
-    if not isinstance(response, str):
-        response = str(response)
-
-    patterns = [
-        r"\\?boxed\{(Yes|No|YES|NO|yes|no)\}",
-        r"\\boxed\s*\{(Yes|No|YES|NO|yes|no)\}",
-        r"\[boxed\{(Yes|No|YES|NO|yes|no)\}\]",
-        r"<boxed>(Yes|No|YES|NO|yes|no)</boxed>",
-    ]
-    for pattern in patterns:
-        matches = re.findall(pattern, response, re.IGNORECASE)
-        if matches:
-            value = matches[-1].lower()
-            if "yes" in value:
-                return 1
-            if "no" in value:
-                return 0
-    return None
+    label = _reward.extract_prediction(response)
+    return {"yes": 1, "no": 0}.get(label)
 
 
 def extract_true_label(output_text: str) -> Optional[int]:
