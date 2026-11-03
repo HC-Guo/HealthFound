@@ -81,7 +81,7 @@ Purpose: teach the base model the target instruction format, clinical reasoning 
 Prepare a LLaMA-Factory training config from:
 
 ```bash
-cp stage_1_sft/sft_config.yaml.template /your/config/location/sft_config.yaml
+cp stage_1_sft/sft_config.yaml /your/config/location/sft_config.yaml
 ```
 
 Then edit all placeholder values in the copied config, including the base model, dataset mixture, output directory, and distributed training settings.
@@ -110,6 +110,7 @@ First run rejection sampling:
 export MODEL_PATH="<STAGE_1_MODEL_OR_CHECKPOINT>"
 export INPUT_JSONL="<RFT_CANDIDATE_INPUT_JSONL>"
 export OUTPUT_JSONL="<ACCEPTED_RFT_OUTPUT_JSONL>"
+export MAX_TOKENS="<RFT_MAX_RESPONSE_TOKENS>"
 export TENSOR_PARALLEL_SIZE=1
 export NUM_GENERATIONS=10
 bash stage_2_rejection_sampling_finetuning/run_rejection_sampling.sh
@@ -152,6 +153,8 @@ export VAL_FILES_JSON="<PYTHON_LIST_OR_JSON_LIST_OF_VALIDATION_FILES>"
 export OUTPUT_DIR="<RL_CHECKPOINT_OUTPUT_DIR>"
 export PROJECT_NAME="<PUBLIC_PROJECT_NAME>"
 export EXPERIMENT_NAME="<PUBLIC_EXPERIMENT_NAME>"
+export RETENTION_LOSS_COEF="<HFPO_RETENTION_LOSS_COEFFICIENT>"
+export ANCHOR_TRAIN_FILES_JSON='["<ANCHOR_TRAIN_JSONL_OR_PARQUET>"]'
 export GPUS_PER_NODE=8
 export MASTER_PORT=6379
 bash stage_3_rl/run_rl_grpo.sh
