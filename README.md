@@ -1,6 +1,6 @@
-# HealthFound Open-Source Training Pipeline
+# HealthFound Training Pipeline
 
-Three-stage training pipeline template for HealthFound model development.
+Three-stage training pipeline for HealthFound model development.
 
 ## Quick Start
 
@@ -55,7 +55,7 @@ print("content:", content)
 ## Directory Layout
 
 ```text
-HealthFound-opensource/
+HealthFound/
   stage_1_sft/
     LLaMA-Factory/
     run_sft.sh
@@ -157,28 +157,10 @@ export MASTER_PORT=6379
 bash stage_3_rl/run_rl_grpo.sh
 ```
 
-`VERL_REPO_DIR`, `REWARD_FUNCTION_PATH`, and `REWARD_FUNCTION_NAME` are optional if you use the GitHub clone and reward template included under `stage_3_rl/`.
 
-`TRAIN_FILES_JSON` and `VAL_FILES_JSON` should be list strings accepted by the downstream veRL command, for example a Python-style list string. Do not commit private data locations to this repository.
 
-The included [stage_3_rl/reward.py](stage_3_rl/reward.py) keeps the original reward structure while replacing internal `data_source` names with generic task aliases: `binary_risk`, `choice_reasoning`, `masked_value`, and `open_qa`. If your released data uses different labels, set `extra_info["task_type"]` or extend `TASK_ALIASES`.
-
-## Privacy Checklist Before Release
-
-Before publishing or sharing this folder, run:
-
-```bash
-grep -R "<PRIVATE_PATTERN>" HealthFound-opensource
-grep -R "/absolute/private/path" HealthFound-opensource
-grep -R "<CREDENTIAL_PATTERN>" HealthFound-opensource
-```
-
-Also inspect generated configs and logs. The templates here do not contain internal dataset names or private file paths, but user-created configs may.
-
-## Notes on 32B Training
-
-The original workflow used full-parameter training for a 32B model. For smaller ablation models, reduce per-device batch size, gradient accumulation, rollout count, tensor parallel size, and total data volume according to available GPU memory. Keep the stage order unchanged:
+## Healthfound Curriculum Training Pipeline
 
 ```text
-base model -> SFT -> rejection sampling -> RFT -> RL
+base model -> SFT -> RFT -> RL
 ```
