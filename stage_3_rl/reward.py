@@ -1,545 +1,456 @@
 from __future__ import annotations
 
+import calendar
 import math
 import re
-from collections import Counter
-from typing import Any, Dict, List, Optional, Tuple
+from collections import Counter, namedtuple
+from datetime import date
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, Optional
 
-try:
-    from mathruler.grader import extract_boxed_content
-except ImportError:
-
-    def extract_boxed_content(text: str) -> str:
-        match = re.findall(r"\\boxed\s*\{([^{}]+)\}", text, flags=re.IGNORECASE | re.DOTALL)
-        return match[-1].strip() if match else text
-
+REWARD_VERSION = "healthfound-paper-s6-v2-20261103"
+NUMERIC_RTOL = Decimal("0.05")
+DATE_TOLERANCE_YEARS = Decimal("0.5")
+INTERVAL_IOU_THRESHOLD = Decimal("0.5")
+BLEU4_SCALE = 300.0
 
 TASK_ALIASES = {
-    "binary_risk": {
-        "binary_risk",
-        "risk_prediction",
-        "diagnosis_prediction",
-        "clinical_risk_prediction",
-    },
-    "choice_reasoning": {
-        "choice_reasoning",
-        "medical_choice_reasoning",
-        "general_choice_reasoning",
-        "multiple_choice",
-    },
-    "masked_value": {
-        "masked_value",
-        "fill_in_the_mask",
-        "structured_value_prediction",
-        "numeric_or_code_prediction",
-    },
-    "open_qa": {
-        "open_qa",
-        "scientific_reasoning_qa",
-        "free_text_qa",
-    },
+    "binary_risk": {"binary_risk", "risk_prediction", "diagnosis_prediction", "clinical_risk_prediction", "ukb_diagnosis"},
+    "choice_reasoning": {"choice_reasoning", "medical_choice_reasoning", "general_choice_reasoning", "multiple_choice", "medical_reasoning", "natural_reasoning"},
+    "masked_value": {"masked_value", "fill_in_the_mask", "structured_value_prediction", "numeric_or_code_prediction", "fim"},
+    "open_qa": {"open_qa", "scientific_reasoning_qa", "free_text_qa", "scientificqa"},
 }
 
 
-def compute_score(
-    data_source: Any,
-    solution_str: str,
-    ground_truth: Any,
-    extra_info: Optional[Dict[str, Any]] = None,
-    reward_router_address: Optional[str] = None,
-    reward_model_tokenizer: Any = None,
-    **_: Any,
-) -> float:
-    """veRL custom reward entrypoint."""
-    del reward_router_address, reward_model_tokenizer
-
-    task_type = normalize_task_type(data_source, extra_info)
-    if task_type == "binary_risk":
-        res = compute_score_binary_risk(solution_str, str(ground_truth))
-    elif task_type == "choice_reasoning":
-        res = compute_score_choice_reasoning(solution_str, str(ground_truth))
-    elif task_type == "masked_value":
-        res = compute_score_masked_value(solution_str, str(ground_truth))
-    elif task_type == "open_qa":
-        res = compute_score_open_qa(solution_str, str(ground_truth))
-    else:
-        raise NotImplementedError(f"Reward function is not implemented for data_source={data_source!r}")
-
-    if isinstance(res, dict):
-        return res
-    if isinstance(res, (int, float, bool)):
-        return float(res)
-    return float(res[0])
-
-
-def normalize_task_type(data_source: Any, extra_info: Optional[Dict[str, Any]]) -> str:
+def normalize_task_type(data_source, extra_info=None):
+    candidates = []
     if isinstance(extra_info, dict):
-        for key in ("task_type", "reward_type", "metric"):
-            value = extra_info.get(key)
-            if value:
-                normalized = str(value).strip().lower()
-                for task_type, aliases in TASK_ALIASES.items():
-                    if normalized == task_type or normalized in aliases:
-                        return task_type
-
-    source = str(data_source or "").strip().lower()
-    for task_type, aliases in TASK_ALIASES.items():
-        if source == task_type or source in aliases:
-            return task_type
-
-    return source
+        candidates += [extra_info.get(k) for k in ("task_type", "reward_type", "metric")]
+    candidates.append(data_source)
+    for candidate in candidates:
+        value = str(candidate or "").strip().lower()
+        for task, aliases in TASK_ALIASES.items():
+            if value in aliases:
+                return task
+    return str(data_source or "").strip().lower()
 
 
-def get_content_between_a_b(start_tag: str, end_tag: str, text: str) -> str:
-    extracted_text = ""
-    start_index = text.find(start_tag)
-    while start_index != -1:
-        end_index = text.find(end_tag, start_index + len(start_tag))
-        if end_index != -1:
-            extracted_text += text[start_index + len(start_tag) : end_index] + " "
-            start_index = text.find(start_tag, end_index + len(end_tag))
-        else:
-            break
-    return extracted_text.strip()
+def compute_score(data_source: Any, solution_str: str, ground_truth: Any,
+                  extra_info: Optional[Dict[str, Any]] = None,
+                  reward_router_address=None, reward_model_tokenizer=None, **kwargs) -> float:
+    """Drop-in veRL entrypoint. Ground-truth/schema errors raise ValueError."""
+    del reward_router_address, reward_model_tokenizer, kwargs
+    task = normalize_task_type(data_source, extra_info)
+    if task == "binary_risk":
+        return compute_score_binary_risk(solution_str, ground_truth)
+    if task == "choice_reasoning":
+        return float(compute_score_choice_reasoning(solution_str, ground_truth))
+    if task == "masked_value":
+        return compute_score_masked_value(solution_str, ground_truth, extra_info=extra_info)
+    if task == "open_qa":
+        return compute_score_open_qa(solution_str, ground_truth)
+    raise NotImplementedError(f"Unknown reward task {data_source!r}")
 
 
-def extract(text: str, section_type: str, hard: bool = True) -> str:
-    if text:
-        target_str = get_content_between_a_b(f"<{section_type}>", f"</{section_type}>", text)
-        if target_str:
-            return target_str
-        if hard:
-            return text
-        return "unk"
-    return "unk"
+def extract_think_and_answer(text):
+    if not isinstance(text, str) or not text.strip():
+        return None, None
+    closes = list(re.finditer(r"</think\s*>", text, re.I))
+    if not closes:
+        return (None, None) if re.search(r"<think\b", text, re.I) else (None, text.strip())
+    last = closes[-1]
+    prefix, final = text[:last.start()], text[last.end():].strip()
+    opens = list(re.finditer(r"<think\s*>", prefix, re.I))
+    reasoning = prefix[opens[-1].end():] if opens else prefix
+    if re.search(r"</?think\b", reasoning, re.I):
+        reasoning = None
+    if re.search(r"</?think\b", final, re.I):
+        final = None
+    return reasoning.strip() if reasoning else None, final or None
 
 
-def parse_response(response: str) -> str:
-    response = response.lower()
-    if "boxed" in response:
-        response = extract_boxed_content(response)
-    elif "<answer>" in response:
-        response = extract(response, "answer")
-
-    answer_patterns = [
-        "**answer**:",
-        "**answer**",
-        "*answer*:",
-        "**answer:**",
-        "answer is",
-        "answer:",
-        "answer in",
-        "final answer",
-        "final answer is",
-    ]
-    for answer_pattern in answer_patterns:
-        if answer_pattern in response:
-            response = response.split(answer_pattern)[-1]
-    return response
-
-
-def judge_multi_choice(answer: str, response: str, alphas: Any = None) -> int:
-    del alphas
-    response = parse_response(response.lower()).strip().lower()
-    response = response.replace("\n", "")
-    split_response = response.split(".")[0]
-    split_response = split_response.split(":")[-1]
-    answer = answer.strip().lower()
-
-    if len(split_response) > 300:
-        return 0
-    return 1 if split_response == answer else 0
-
-
-def compute_score_choice_reasoning(solution_str: str, ground_truth: str) -> int:
-    response = extract(solution_str, "answer")
-    return judge_multi_choice(ground_truth, response)
-
-
-def count_think_tags(text: str) -> Tuple[int, int]:
-    return text.count("<think>"), text.count("</think>")
-
-
-def extract_think_and_answer(solution_str: str) -> Tuple[Optional[str], Optional[str]]:
-    think_pattern = r"<think>(.*?)</think>"
-    think_match = re.search(think_pattern, solution_str, re.IGNORECASE | re.DOTALL)
-    if not think_match:
-        return None, solution_str
-
-    think_content = think_match.group(1).strip()
-    answer_content = solution_str[think_match.end() :].strip()
-    return think_content, answer_content
+def _terminal_suffix(text):
+    return not text.strip(" \t\r\n.$!。！")
 
 
 def _extract_final_answer(text):
-    """Return the final-answer payload without searching reasoning for answers."""
-    if not isinstance(text, str) or not text.strip():
+    _, text = extract_think_and_answer(text)
+    if text is None:
         return None
-
-    closing = list(re.finditer(r"</think\s*>", text, re.IGNORECASE))
-    if closing:
-        text = text[closing[-1].end():].strip()
-    if re.search(r"</?think\b", text, re.IGNORECASE):
-        return None
-
-    if re.search(r"</?answer\b", text, re.IGNORECASE):
-        fields = re.findall(r"<answer\s*>(.*?)</answer\s*>", text, re.IGNORECASE | re.DOTALL)
-        opens = re.findall(r"<answer\s*>", text, re.IGNORECASE)
-        closes = re.findall(r"</answer\s*>", text, re.IGNORECASE)
-        if len(fields) != 1 or len(opens) != 1 or len(closes) != 1:
+    if re.search(r"</?answer\b", text, re.I):
+        fields = list(re.finditer(r"<answer\s*>(.*?)</answer\s*>", text, re.I | re.S))
+        if (len(fields) != 1 or len(re.findall(r"<answer\s*>", text, re.I)) != 1
+                or len(re.findall(r"</answer\s*>", text, re.I)) != 1):
             return None
-        text = fields[0].strip()
-
-    markers = list(re.finditer(r"\[Prediction\]\s*:", text, re.IGNORECASE))
+        field = fields[0]
+        if not _terminal_suffix(text[field.end():]):
+            return None
+        text = field.group(1).strip()
+    markers = list(re.finditer(
+        r"\[(?:Prediction|Answer)\]\s*:|(?:^|\n)\s*(?:the\s+)?(?:final\s+answer|answer)\s*(?::|\bis\b)\s*", text, re.I))
     if markers:
         text = text[markers[-1].end():].strip()
         text = re.split(r"\n\s*\[[A-Za-z][^\]\n]*\]\s*:", text, maxsplit=1)[0].strip()
-
-    box_start = r"(?:\\+boxed|<boxed\b|\[boxed\{)"
-    starts = re.findall(box_start, text, re.IGNORECASE)
+    starts = list(re.finditer(r"\\+boxed\b|<boxed\b|\[boxed\{", text, re.I))
     if starts:
-        boxes = list(re.finditer(
-            r"\\+boxed\s*\{([^{}]*)\}|<boxed\s*>([^<>]*)</boxed\s*>|\[boxed\{([^{}]*)\}\]",
-            text, re.IGNORECASE | re.DOTALL,
-        ))
-        if len(boxes) != len(starts):
-            return None
-        text = next(value for value in boxes[-1].groups() if value is not None).strip()
-    else:
-        marker = re.search(r"(?:final\s+answer|answer)\s*:\s*", text, re.IGNORECASE)
-        if marker:
-            text = text[marker.end():].strip()
-
-    if re.search(r"</?think\b", text, re.IGNORECASE):
+        start = starts[-1]
+        suffix = text[start.start():]
+        if suffix.lower().startswith("<boxed"):
+            field = re.fullmatch(r"<boxed\s*>(.*?)</boxed\s*>([\s.$!。！]*)", suffix, re.I | re.S)
+            if not field:
+                return None
+            text = field.group(1).strip()
+        else:
+            opening = re.match(r"(?:\\+boxed\s*|\[boxed)\{", suffix, re.I)
+            if not opening:
+                return None
+            depth, close = 1, None
+            for i in range(opening.end(), len(suffix)):
+                if suffix[i] == "{":
+                    depth += 1
+                elif suffix[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        close = i; break
+            if close is None:
+                return None
+            rest = suffix[close+1:]
+            if suffix.startswith("["):
+                if not rest.startswith("]"):
+                    return None
+                rest = rest[1:]
+            if not _terminal_suffix(rest):
+                return None
+            text = suffix[opening.end():close].strip()
+    if re.search(r"</?think\b|</?answer\b", text, re.I):
         return None
     return text or None
 
 
+def _binary_payload(text):
+    if not isinstance(text, str):
+        return None
+    text = text.strip().strip("* \t\r\n").rstrip(".!。！").strip().casefold()
+    aliases = {"yes": "yes", "high risk": "yes", "high-risk": "yes", "positive": "yes",
+               "no": "no", "low risk": "no", "low-risk": "no", "negative": "no"}
+    if text in aliases:
+        return aliases[text]
+    m = re.fullmatch(r"(?:the\s+)?(?:subject|patient)\s+is\s+at\s+(?:a\s+)?(high|low)\s+risk"
+                     r"(?:\s+of\s+developing\s+([\w\s,'()\-/&]+))?", text)
+    if m and not re.search(r"\b(?:yes|no|not|unknown|however|but|instead|actually|prediction|answer|conclusion)\b|\b(?:high|low)\s+risk\b", m.group(2) or ""):
+        return "yes" if m.group(1) == "high" else "no"
+    return None
+
+
 def extract_prediction(response):
-    """Return 'yes', 'no', or 'unk' from an explicit final prediction."""
-    answer = _extract_final_answer(response)
-    if answer is None:
-        return "unk"
-    answer = answer.strip().strip("* \t\r\n").rstrip(".!。！").strip().lower()
-    aliases = {
-        "yes": "yes", "high risk": "yes", "high-risk": "yes", "positive": "yes",
-        "no": "no", "low risk": "no", "low-risk": "no", "negative": "no",
-    }
-    if answer in aliases:
-        return aliases[answer]
-    match = re.fullmatch(
-        r"(?:the\s+)?subject\s+is\s+at\s+(?:a\s+)?(high|low)\s+risk\s+of\s+developing\s+[^\n]+",
-        answer,
-    )
-    if match:
-        return "yes" if match.group(1) == "high" else "no"
-    return "unk"
+    return _binary_payload(_extract_final_answer(response)) or "unk"
+
+
+def _reasoning_prediction(reasoning):
+    if not reasoning:
+        return None
+    fields = list(re.finditer(r"<risk\s*>(.*?)</risk\s*>", reasoning, re.I | re.S))
+    if fields:
+        if not _terminal_suffix(reasoning[fields[-1].end():]):
+            return None
+        values = [_binary_payload(v.group(1)) for v in fields]
+        return values[-1] if all(v is not None and v == values[-1] for v in values) else None
+    direct = extract_prediction(reasoning)
+    if direct != "unk":
+        return direct
+    markers = list(re.finditer(r"(?:^|[\n.!?]\s*)(?:overall\s+risk|risk\s+prediction|final\s+risk|risk|conclusion)\s*:\s*", reasoning, re.I))
+    if markers:
+        return _binary_payload(reasoning[markers[-1].end():])
+    last = re.split(r"[\n.!?]+\s*", reasoning.strip().rstrip(".!?"))[-1]
+    return _binary_payload(last)
+
+
+def binary_risk_components(solution_str, ground_truth):
+    target = extract_prediction(str(ground_truth))
+    if target not in {"yes", "no"}:
+        raise ValueError("Ground truth must contain an unambiguous binary risk label")
+    reasoning, _ = extract_think_and_answer(solution_str)
+    answer = extract_prediction(solution_str)
+    answer = answer if answer in {"yes", "no"} else None
+    thought = _reasoning_prediction(reasoning)
+    accuracy = 1.0 if answer == target else (-0.1 if target == "yes" else 0.0)
+    return dict(answer_accuracy=accuracy,
+                think_accuracy=float(thought is not None and thought == target),
+                think_answer_consistency=float(answer is not None and thought is not None and answer == thought))
 
 
 def compute_score_binary_risk(solution_str, ground_truth, weights=None):
     if weights is None:
-        weights = {
-            "answer_accuracy": 0.8,
-            "think_accuracy": 0.1,
-            "think_answer_consistency": 0.1,
-        }
-
-    true_risk = extract_prediction(ground_truth)
-    if true_risk not in {"yes", "no"}:
-        raise ValueError("Invalid ground-truth binary-risk label")
-    if not solution_str:
-        return 0.0
-
-    closing = list(re.finditer(r"</think\s*>", solution_str, re.IGNORECASE))
-    think_content = None
-    if closing:
-        think_content = re.sub(
-            r"</?think\s*>", "", solution_str[:closing[-1].start()], flags=re.IGNORECASE,
-        ).strip()
-    answer_prediction = extract_prediction(solution_str)
-    if answer_prediction not in {"yes", "no"}:
-        return 0.0
-    think_prediction = extract_prediction(think_content)
-
-    if answer_prediction == true_risk:
-        answer_accuracy = 1.0
-    elif true_risk == "yes" and answer_prediction == "no":
-        answer_accuracy = -0.1  # Preserve the original false-low penalty.
-    else:
-        answer_accuracy = 0.0
-    think_accuracy = float(think_prediction in {"yes", "no"} and think_prediction == true_risk)
-    consistency = float(
-        think_prediction in {"yes", "no"} and think_prediction == answer_prediction
-    )
-    return float(
-        weights["answer_accuracy"] * answer_accuracy
-        + weights["think_accuracy"] * think_accuracy
-        + weights["think_answer_consistency"] * consistency
-    )
+        weights = dict(answer_accuracy=0.8, think_accuracy=0.1, think_answer_consistency=0.1)
+    parts = binary_risk_components(solution_str, ground_truth)
+    return float(sum(weights[k]*parts[k] for k in parts))
 
 
-def parse_date_to_float(text: str) -> Optional[float]:
-    text = text.strip()
+def _choice(text):
+    text = _extract_final_answer(text)
+    if text is None:
+        return None
+    text = text.strip().strip("*")
+    m = re.fullmatch(r"\s*(?:(?:option|choice)\s*)?[\[(]?\s*([A-Z]|\d{1,2}|yes|no|maybe|true|false)\s*[\])]?\s*[.!。]?\s*", text, re.I)
+    return m.group(1).upper() if m else None
+
+
+def judge_multi_choice(answer, response, alphas=None):
+    del alphas
+    target = _choice(str(answer))
+    if target is None:
+        raise ValueError("Multiple-choice ground truth must be one normalized option label")
+    return int(_choice(response) == target)
+
+
+def compute_score_choice_reasoning(solution_str, ground_truth):
+    return judge_multi_choice(ground_truth, solution_str)
+
+
+_Value = namedtuple("_Value", "kind value unit")
+_NUMBER = r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+_ISO_DATE = r"\d{4}(?:[-/]\d{1,2})(?:[-/]\d{1,2})?"
+_WORDS = dict(zero="0", no="0", one="1", two="2", three="3", four="4", five="5", six="6", seven="7", eight="8", nine="9", ten="10")
+_UNITS = {"%", "mmol/l", "mmol/mol", "umol/l", "mg/dl", "g/dl", "g/l", "ng/ml", "pg/ml",
+          "ug/l", "nmol/l", "pmol/l", "u/l", "iu/l", "miu/l", "kg", "g", "cm", "mm", "m",
+          "kg/m2", "kg/m^2", "mmhg", "bpm", "year", "years", "day", "days", "week", "weeks",
+          "month", "months", "10^9/l", "10^12/l", "x10^9/l", "x10^12/l", "ml/min/1.73m2"}
+
+
+def _unit(text):
+    return re.sub(r"\s+", "", text).casefold().replace("μ", "u").replace("µ", "u").replace("²", "2")
+
+
+def _numeric(text, expected_unit=None):
+    text = text.strip().replace("−", "-")
+    text = re.sub(r"^(?:approximately|approx\.?|about)\s+", "", text, flags=re.I)
+    text = _WORDS.get(text.casefold(), text)
+    m = re.fullmatch(r"("+_NUMBER+r")\s*(.*?)", text)
+    if not m:
+        return None
+    unit = _unit(m.group(2).rstrip("."))
+    expected = _unit(expected_unit) if expected_unit else None
+    if unit and unit not in _UNITS and unit != expected:
+        return None
+    if expected and unit and unit != expected:
+        return None
     try:
-        match = re.search(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", text)
-        if match:
-            year, month, day = map(int, match.groups())
-            return year + (month - 1) / 12 + (day - 1) / 365
+        number = Decimal(m.group(1).replace(",", ""))
+    except InvalidOperation:
+        return None
+    return _Value("number", number, unit or expected) if number.is_finite() else None
 
-        match = re.search(r"\b(\d{4})[-/](\d{1,2})\b", text)
-        if match:
-            year, month = map(int, match.groups())
-            return year + (month - 1) / 12
 
-        match = re.search(r"\b(\d{4})\b", text)
-        if match:
-            return float(match.group(1))
-    except Exception:
-        pass
+def _date_value(text):
+    text = text.strip()
+    m = re.fullmatch(r"(\d{4})(?:[-/](\d{1,2})(?:[-/](\d{1,2}))?)?", text)
+    if m:
+        year, month, day = int(m[1]), int(m[2] or 1), int(m[3] or 1)
+        try:
+            parsed = date(year, month, day)
+        except ValueError:
+            return None
+        return Decimal(year)+Decimal((parsed-date(year, 1, 1)).days)/Decimal(366 if calendar.isleap(year) else 365)
+    m = re.fullmatch(r"\d{4}\.\d+", text)
+    if m:
+        value = Decimal(text)
+        return value if 1 <= value < 10000 else None
     return None
 
 
-def calculate_iou(range_a: Tuple[float, float], range_b: Tuple[float, float]) -> float:
-    start_a, end_a = sorted(range_a)
-    start_b, end_b = sorted(range_b)
-
-    intersection_start = max(start_a, start_b)
-    intersection_end = min(end_a, end_b)
-    if intersection_end <= intersection_start:
-        return 0.0
-
-    intersection_len = intersection_end - intersection_start
-    union_start = min(start_a, start_b)
-    union_end = max(end_a, end_b)
-    union_len = union_end - union_start
-    return intersection_len / union_len if union_len > 0 else 0.0
+def parse_date_to_float(text):
+    value = _date_value(text)
+    return float(value) if value is not None else None
 
 
-def extract_value_hybrid(text: str) -> Tuple[Optional[Any], Optional[str]]:
-    if not text:
-        return None, None
+def _interval(text, date_mode=False, expected_unit=None):
+    if any(c in text for c in "[]()"):
+        text = text.strip()
+        if not text.startswith(("[", "(")):
+            return None
+        close = "]" if text[0] == "[" else ")"
+        position = text.find(close)
+        if position < 0 or any(c in text[1:position]+text[position+1:] for c in "[]()"):
+            return None
+    if date_mode:
+        atom = r"(?:"+_ISO_DATE+r"|\d{4}(?:\.\d+)?)"
+        m = re.fullmatch(r"\s*[\[(]?\s*("+atom+r")\s*(?:to|and|through|\s[-–—]\s|,)\s*("+atom+r")\s*[\])]?\s*", text, re.I)
+        if not m:
+            m = re.fullmatch(r"\s*(\d{4})\s*[-–—]\s*(\d{4})\s*", text)
+        if not m:
+            return None
+        a, b = _date_value(m[1]), _date_value(m[2])
+        if a is None or b is None:
+            return None
+        return _Value("date_interval", tuple(sorted((a, b))), None)
+    atom = _NUMBER
+    m = re.fullmatch(r"\s*[\[(]?\s*("+atom+r")\s*(?:to|and|[-–—~]|,)\s*("+atom+r")\s*[\])]?\s*(.*?)", text.replace("−", "-"), re.I)
+    if not m:
+        return None
+    unit = m[3].strip()
+    a, b = _numeric(m[1]+unit, expected_unit), _numeric(m[2]+unit, expected_unit)
+    if a is None or b is None:
+        return None
+    return _Value("interval", tuple(sorted((a.value, b.value))), a.unit)
 
-    if "[Prediction]:" in text:
-        text = text.split("[Prediction]:")[-1]
-        if "[" in text:
-            text = text.split("[")[0]
+
+def _icd(text):
+    text = re.sub(r"^ICD(?:-?10)?(?:\s+code)?\s*:\s*", "", text.strip(), flags=re.I)
+    if re.fullmatch(r"[A-Z]\d{2}(?:\.[A-Z0-9]{1,4})?", text, re.I):
+        return _Value("code", text.upper(), None)
+    return None
+
+
+def _type(value):
+    aliases = {"number": "number", "numeric": "number", "point": "number", "float": "number",
+               "date": "date", "year": "date", "code": "code", "icd": "code", "icd10": "code",
+               "interval": "interval", "range": "interval", "numeric_interval": "interval",
+               "date_interval": "date_interval", "date_range": "date_interval"}
+    if value is None:
+        return None
+    key = str(value).strip().lower()
+    if key not in aliases:
+        raise ValueError(f"Unsupported FIM target_type {value!r}; S6 defines numeric/date/interval/ICD rewards")
+    return aliases[key]
+
+
+def _parse_value(text, kind=None, expected_unit=None):
+    if not isinstance(text, str) or not text.strip():
+        return None
     text = text.strip()
-
-    code_match = re.search(r"\b([A-Z]\d{2}(?:\.\d{1,2})?)\b", text)
-    if code_match:
-        return code_match.group(1).upper(), "code"
-
-    date_range_pattern = (
-        r"(\d{4}(?:[-/]\d{1,2})?(?:[-/]\d{1,2})?)\s*(?:-|to|and)\s*"
-        r"(\d{4}(?:[-/]\d{1,2})?(?:[-/]\d{1,2})?)"
-    )
-    date_range_match = re.search(date_range_pattern, text)
-    if date_range_match:
-        value_1 = parse_date_to_float(date_range_match.group(1))
-        value_2 = parse_date_to_float(date_range_match.group(2))
-        if value_1 and value_2 and 1800 < value_1 < 2100 and 1800 < value_2 < 2100:
-            return (min(value_1, value_2), max(value_1, value_2)), "range"
-
-    date_match = re.search(r"\b\d{4}(?:[-/]\d{1,2})?(?:[-/]\d{1,2})?\b", text)
-    if date_match:
-        value = parse_date_to_float(date_match.group(0))
-        if value and 1800 < value < 2100:
-            return value, "point"
-
-    text_num_map = {
-        "one": "1",
-        "two": "2",
-        "three": "3",
-        "four": "4",
-        "five": "5",
-        "six": "6",
-        "seven": "7",
-        "eight": "8",
-        "nine": "9",
-        "ten": "10",
-        "no": "0",
-        "zero": "0",
-    }
-    text_lower = text.lower()
-    for word, digit in text_num_map.items():
-        text_lower = re.sub(r"\b" + word + r"\b", digit, text_lower)
-    text = text_lower
-
-    if date_range_match:
-        text = text.replace(date_range_match.group(0), "")
-    elif date_match:
-        text = text.replace(date_match.group(0), "")
-
-    text = text.replace(",", "").replace("%", "")
-    text = text.replace("–", "-").replace("—", "-").replace("~", "-").replace("to", "-")
-    text = re.sub(r"\b(years?|old|weeks?|days?|months?)\b", "", text)
-
-    range_match = re.search(r"(-?\d+(?:\.\d+)?)\s*(?:-|and)\s*(-?\d+(?:\.\d+)?)", text)
-    if range_match:
-        try:
-            value_1 = float(range_match.group(1))
-            value_2 = float(range_match.group(2))
-            return (min(value_1, value_2), max(value_1, value_2)), "range"
-        except Exception:
-            pass
-
-    matches = re.findall(r"(-?\d+(?:\.\d+)?)", text)
-    if matches:
-        return float(matches[0]), "point"
-
-    return None, None
+    if kind == "code":
+        return _icd(text)
+    if kind in {"date", "date_interval"}:
+        point = _date_value(text)
+        return _Value("date", point, None) if point is not None else _interval(text, True)
+    if kind in {"number", "interval"}:
+        return _numeric(text, expected_unit) or _interval(text, False, expected_unit)
+    code = _icd(text)
+    if code:
+        return code
+    if re.fullmatch(_ISO_DATE, text):
+        value = _date_value(text)
+        return _Value("date", value, None) if value is not None else None
+    if re.search(_ISO_DATE+r"\s+(?:to|and|through)\s+"+_ISO_DATE, text, re.I):
+        return _interval(text, True)
+    return _numeric(text, expected_unit) or _interval(text, False, expected_unit)
 
 
-def compute_score_masked_value(solution_str, ground_truth):
-    if not solution_str or not ground_truth:
+def extract_value_hybrid(text, target_type=None):
+    """Compatibility helper, now requiring a complete scalar/interval payload."""
+    payload = _extract_final_answer(text)
+    parsed = _parse_value(payload, _type(target_type)) if payload else None
+    if parsed is None:
+        return None, None
+    kind = {"number": "point", "interval": "range", "date_interval": "range"}.get(parsed.kind, parsed.kind)
+    value = tuple(map(float, parsed.value)) if isinstance(parsed.value, tuple) else float(parsed.value) if isinstance(parsed.value, Decimal) else parsed.value
+    return value, kind
+
+
+def _iou(a, b):
+    a, b = sorted(a), sorted(b)
+    union = max(a[1], b[1])-min(a[0], b[0])
+    if union == 0:
+        return Decimal(int(a == b))
+    intersection = max(Decimal(0), min(a[1], b[1])-max(a[0], b[0]))
+    return intersection/union
+
+
+def calculate_iou(range_a, range_b):
+    return float(_iou(tuple(Decimal(str(x)) for x in range_a), tuple(Decimal(str(x)) for x in range_b)))
+
+
+def compute_score_masked_value(solution_str, ground_truth, extra_info=None, target_type=None):
+    metadata = extra_info if isinstance(extra_info, dict) else {}
+    unit = metadata.get("unit")
+    if isinstance(ground_truth, dict):
+        target_type = target_type or ground_truth.get("target_type") or ground_truth.get("type")
+        unit = ground_truth.get("unit", unit)
+        ground_truth = ground_truth.get("value")
+    kind = _type(target_type or metadata.get("target_type") or metadata.get("value_type"))
+    target_text = _extract_final_answer(str(ground_truth)) if ground_truth is not None else None
+    target = _parse_value(target_text, kind, unit) if target_text else None
+    if target is None:
+        raise ValueError("Unparseable FIM ground truth; provide a scalar/interval/ICD and explicit target_type for ambiguous dates")
+    if kind in {"interval", "date_interval"} and not isinstance(target.value, tuple):
+        raise ValueError("Interval target_type requires two ground-truth endpoints")
+    answer = _extract_final_answer(solution_str)
+    pred = _parse_value(answer, target.kind, unit) if answer else None
+    if pred is None:
         return 0.0
-
-    final_answer = _extract_final_answer(solution_str)
-    final_target = _extract_final_answer(ground_truth)
-    if final_answer is None or final_target is None:
+    if target.unit and pred.unit and target.unit != pred.unit:
         return 0.0
-    pred_val, pred_type = extract_value_hybrid(final_answer)
-    gt_val, gt_type = extract_value_hybrid(final_target)
-    if pred_val is None or gt_val is None:
-        return 0.0
-
-    correct = False
-    iou_threshold = 0.5
-    if gt_type == "code" or pred_type == "code":
-        pred_str = str(pred_val).upper()
-        gt_str = str(gt_val).upper()
-        if pred_str in gt_str or gt_str in pred_str or (
-            len(pred_str) >= 3 and len(gt_str) >= 3 and pred_str[:3] == gt_str[:3]
-        ):
-            correct = True
+    if target.kind == "code":
+        a, b = pred.value, target.value
+        return float(a in b or b in a or a[:3] == b[:3])
+    if isinstance(target.value, tuple):
+        lower, upper = target.value
     else:
-        if gt_type == "range":
-            gt_min, gt_max = gt_val
-        elif gt_type == "point":
-            value = float(gt_val)
-            if value > 1800:
-                gt_min, gt_max = value - 0.5, value + 0.5
-            else:
-                gt_min, gt_max = sorted((value * 0.95, value * 1.05))
-        else:
-            return 0.0
-        if pred_type == "point":
-            correct = gt_min <= float(pred_val) <= gt_max
-        elif pred_type == "range":
-            correct = calculate_iou((gt_min, gt_max), pred_val) >= iou_threshold
-    return 1.0 if correct else 0.0
+        tolerance = DATE_TOLERANCE_YEARS if target.kind == "date" else abs(target.value)*NUMERIC_RTOL
+        lower, upper = target.value-tolerance, target.value+tolerance
+    if isinstance(pred.value, tuple):
+        return float(_iou((lower, upper), pred.value) >= INTERVAL_IOU_THRESHOLD)
+    return float(lower <= pred.value <= upper)
 
 
-def _tokenize(text: str) -> List[str]:
+def _tokenize(text):
     return re.findall(r"[a-z0-9]+(?:'[a-z]+)?", text.lower())
 
 
-def _ngram_counts(tokens: List[str], n: int) -> Counter:
-    ngrams = zip(*[tokens[i:] for i in range(n)])
-    return Counter(" ".join(ngram) for ngram in ngrams)
-
-
-def _bleu_4_score(candidate: str, reference: str) -> float:
-    cand_tokens = _tokenize(candidate)
-    ref_tokens = _tokenize(reference)
-    if not cand_tokens or not ref_tokens:
+def _bleu_4_score(candidate, reference):
+    cand, ref = _tokenize(candidate), _tokenize(reference)
+    if not cand or not ref:
         return 0.0
-
-    precisions = []
+    precision = []
     for n in range(1, 5):
-        cand_counts = _ngram_counts(cand_tokens, n)
-        ref_counts = _ngram_counts(ref_tokens, n)
-
-        clipped_count = 0
-        for ngram, count in cand_counts.items():
-            ref_count = ref_counts.get(ngram, 0)
-            clipped_count += min(count, ref_count)
-
-        total_cand_ngrams = max(len(cand_tokens) - n + 1, 1)
-        precision = clipped_count / total_cand_ngrams
-        precisions.append(precision)
-
-    if min(precisions) == 0:
-        geom_mean = 0.0
-    else:
-        geom_mean = math.exp(sum(math.log(p) for p in precisions) / 4)
-
-    cand_len = len(cand_tokens)
-    ref_len = len(ref_tokens)
-    if cand_len > ref_len:
-        brevity_penalty = 1.0
-    else:
-        brevity_penalty = math.exp(1 - ref_len / max(cand_len, 1))
-
-    return brevity_penalty * geom_mean
-
-
-def _rouge_l_f1(candidate: str, reference: str) -> float:
-    cand_tokens = _tokenize(candidate)
-    ref_tokens = _tokenize(reference)
-    if not cand_tokens or not ref_tokens:
+        cc = Counter(tuple(cand[i:i+n]) for i in range(max(0, len(cand)-n+1)))
+        rc = Counter(tuple(ref[i:i+n]) for i in range(max(0, len(ref)-n+1)))
+        clipped = sum(min(v, rc[k]) for k, v in cc.items())
+        precision.append(clipped/max(1, len(cand)-n+1))
+    if not min(precision):
         return 0.0
+    brevity = 1.0 if len(cand) > len(ref) else math.exp(1-len(ref)/len(cand))
+    return brevity*math.exp(sum(math.log(p) for p in precision)/4)
 
-    rows, cols = len(cand_tokens), len(ref_tokens)
-    dp = [[0] * (cols + 1) for _ in range(rows + 1)]
-    for i in range(1, rows + 1):
-        for j in range(1, cols + 1):
-            if cand_tokens[i - 1] == ref_tokens[j - 1]:
-                dp[i][j] = dp[i - 1][j - 1] + 1
-            else:
-                dp[i][j] = max(dp[i - 1][j], dp[i][j - 1])
 
-    lcs = dp[rows][cols]
-    precision = lcs / rows if rows > 0 else 0.0
-    recall = lcs / cols if cols > 0 else 0.0
-    if precision + recall == 0:
+def _rouge_l_f1(candidate, reference):
+    a, b = _tokenize(candidate), _tokenize(reference)
+    if not a or not b:
         return 0.0
-    return 2 * precision * recall / (precision + recall)
+    previous = [0]*(len(b)+1)
+    for x in a:
+        current = [0]
+        for j, y in enumerate(b, 1):
+            current.append(previous[j-1]+1 if x == y else max(previous[j], current[-1]))
+        previous = current
+    return 2*previous[-1]/(len(a)+len(b))
 
 
-def _f1_word_overlap(candidate: str, reference: str) -> float:
-    cand_words = set(_tokenize(candidate))
-    ref_words = set(_tokenize(reference))
-    if not cand_words or not ref_words:
-        return 0.0
-
-    intersection = cand_words & ref_words
-    precision = len(intersection) / len(cand_words)
-    recall = len(intersection) / len(ref_words)
-    if precision + recall == 0:
-        return 0.0
-    return 2 * precision * recall / (precision + recall)
+def _f1_word_overlap(candidate, reference):
+    a, b = set(candidate.lower().split()), set(reference.lower().split())
+    return 2*len(a & b)/(len(a)+len(b)) if a and b else 0.0
 
 
-def _string_similarity_jaccard(candidate: str, reference: str) -> float:
-    cand_chars = set(candidate.lower().strip())
-    ref_chars = set(reference.lower().strip())
-    if not cand_chars or not ref_chars:
-        return 0.0
-    intersection = cand_chars & ref_chars
-    union = cand_chars | ref_chars
-    return len(intersection) / len(union)
+def _string_similarity_jaccard(candidate, reference):
+    a, b = set(candidate.lower().strip()), set(reference.lower().strip())
+    return len(a & b)/len(a | b) if a and b else 0.0
 
 
-def compute_score_open_qa(solution_str: str, ground_truth: str) -> float:
-    if not solution_str or not ground_truth:
-        return 0.0
+def open_qa_components(solution_str, ground_truth):
+    target = _extract_final_answer(str(ground_truth))
+    if target is None:
+        raise ValueError("Open-QA ground truth must contain a nonempty final answer")
+    answer = _extract_final_answer(solution_str)
+    if answer is None:
+        return dict(bleu4_scaled=0.0, rouge_l=0.0, word_f1=0.0, character_jaccard=0.0)
+    return dict(bleu4_scaled=min(BLEU4_SCALE*_bleu_4_score(answer, target), 1.0),
+                rouge_l=_rouge_l_f1(answer, target), word_f1=_f1_word_overlap(answer, target),
+                character_jaccard=_string_similarity_jaccard(answer, target))
 
-    answer = solution_str.strip()
-    if "[Prediction]:" in answer:
-        answer = answer.split("[Prediction]:")[-1].strip()
-    if "[Answer]:" in answer:
-        answer = answer.split("[Answer]:")[-1].strip()
 
-    bleu4 = _bleu_4_score(answer, ground_truth)
-    rouge_l = _rouge_l_f1(answer, ground_truth)
-    f1_word = _f1_word_overlap(answer, ground_truth)
-    jaccard = _string_similarity_jaccard(answer, ground_truth)
-
-    bleu4_scaled = min(bleu4 * 300.0, 1.0)
-    reward = (bleu4_scaled + rouge_l + f1_word + jaccard) / 4.0
-    return max(0.0, min(1.0, reward))
-
+def compute_score_open_qa(solution_str, ground_truth):
+    parts = open_qa_components(solution_str, ground_truth)
+    return float(max(0.0, min(1.0, sum(parts.values())/4)))
 
 
 compute_score_risk_prediction = compute_score_binary_risk
