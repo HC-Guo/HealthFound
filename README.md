@@ -2,6 +2,11 @@
 
 Three-stage training pipeline for HealthFound model development.
 
+## Overview of Healthfound Curriculum Training Pipeline
+```text
+base model -> SFT -> RFT -> RL
+```
+
 ## Quick Start
 
 ```python
@@ -162,8 +167,4 @@ bash stage_3_rl/run_rl_grpo.sh
 
 
 
-## Healthfound Curriculum Training Pipeline
 
-```text
-base model -> SFT -> RFT -> RL
-```
