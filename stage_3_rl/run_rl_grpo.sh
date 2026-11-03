@@ -1,4 +1,3 @@
-#!/usr/bin/env bash
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,6 +11,18 @@ REWARD_FUNCTION_NAME="${REWARD_FUNCTION_NAME:-compute_score}"
 : "${OUTPUT_DIR:?Set OUTPUT_DIR to the checkpoint output directory.}"
 : "${PROJECT_NAME:?Set PROJECT_NAME to a public-safe project name.}"
 : "${EXPERIMENT_NAME:?Set EXPERIMENT_NAME to a public-safe experiment name.}"
+: "${RETENTION_LOSS_COEF:?Set RETENTION_LOSS_COEF to the selected HFPO coefficient; use 0 explicitly for GRPO without supervised retention.}"
+
+RETENTION_ENABLED="$(python3 -c '
+import math, sys
+value = float(sys.argv[1])
+if not math.isfinite(value) or value < 0:
+    raise SystemExit("RETENTION_LOSS_COEF must be finite and nonnegative")
+print(int(value > 0))
+' "${RETENTION_LOSS_COEF}")"
+if [[ "${RETENTION_ENABLED}" == "1" ]]; then
+  : "${ANCHOR_TRAIN_FILES_JSON:?Set ANCHOR_TRAIN_FILES_JSON to the trusted supervised anchor file list.}"
+fi
 
 if [[ -n "${CONDA_ENV_NAME:-}" ]]; then
   source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -90,6 +101,17 @@ if [[ "${RANK}" == "0" ]]; then
     actor_rollout_ref.actor.use_kl_loss="${USE_KL_LOSS:-True}"
     actor_rollout_ref.actor.kl_loss_coef="${KL_LOSS_COEF:-0.001}"
     actor_rollout_ref.actor.kl_loss_type="${KL_LOSS_TYPE:-low_var_kl}"
+    actor_rollout_ref.actor.retention_loss_coef="${RETENTION_LOSS_COEF}"
+    actor_rollout_ref.actor.retention_micro_batch_size_per_gpu="${RETENTION_MICRO_BATCH_SIZE_PER_GPU:-1}"
+    data.retention.train_files="${ANCHOR_TRAIN_FILES_JSON:-[]}"
+    data.retention.batch_size="${ANCHOR_BATCH_SIZE:-32}"
+    data.retention.prompt_key="${ANCHOR_PROMPT_KEY:-prompt}"
+    data.retention.response_key="${ANCHOR_RESPONSE_KEY:-response}"
+    data.retention.instruction_key="${ANCHOR_INSTRUCTION_KEY:-null}"
+    data.retention.max_prompt_length="${ANCHOR_MAX_PROMPT_LENGTH:-2048}"
+    data.retention.max_response_length="${ANCHOR_MAX_RESPONSE_LENGTH:-2048}"
+    data.retention.seed="${ANCHOR_SEED:-42}"
+    data.retention.shuffle="${ANCHOR_SHUFFLE:-True}"
     actor_rollout_ref.actor.entropy_coeff="${ENTROPY_COEFF:-0}"
     actor_rollout_ref.model.enable_gradient_checkpointing="${ENABLE_GRADIENT_CHECKPOINTING:-True}"
     actor_rollout_ref.actor.fsdp_config.param_offload="${ACTOR_PARAM_OFFLOAD:-False}"
@@ -114,6 +136,8 @@ if [[ "${RANK}" == "0" ]]; then
     trainer.save_freq="${SAVE_FREQ:-40}"
     trainer.test_freq="${TEST_FREQ:-20}"
     trainer.total_epochs="${TOTAL_EPOCHS:-1}"
+    trainer.resume_mode="${RESUME_MODE:-auto}"
+    trainer.resume_from_path="${RESUME_FROM_PATH:-null}"
   )
 
   if [[ -n "${LOG_PATH:-}" ]]; then
