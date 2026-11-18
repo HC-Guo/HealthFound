@@ -1,0 +1,48 @@
+# Model
+model_name_or_path: <STAGE_1_MODEL_OR_CHECKPOINT>
+trust_remote_code: true
+
+# Training stage
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: <DEEPSPEED_CONFIG_PATH>
+
+# Data
+dataset: <RFT_ACCEPTED_DATASET_MIX>
+template: <CHAT_TEMPLATE>
+cutoff_len: 4096
+overwrite_cache: false
+preprocessing_num_workers: <NUM_PREPROCESS_WORKERS>
+dataloader_num_workers: <NUM_DATALOADER_WORKERS>
+
+# Output
+output_dir: <RFT_OUTPUT_DIR>
+overwrite_output_dir: true
+save_only_model: false
+logging_steps: 50
+save_steps: 500
+save_total_limit: 1
+plot_loss: true
+report_to: <LOGGER_NAME_OR_NONE>
+
+# Optimization
+per_device_train_batch_size: <PER_DEVICE_BATCH_SIZE>
+gradient_accumulation_steps: <GRADIENT_ACCUMULATION_STEPS>
+learning_rate: 5.0e-6
+num_train_epochs: 1
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+
+# Resume
+resume_from_checkpoint: <true_OR_false>
+
+# Precision and memory
+bf16: true
+fp16: false
+gradient_checkpointing: true
+
+# Distributed training
+ddp_find_unused_parameters: false
+ddp_timeout: 3600000
+

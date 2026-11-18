@@ -1,0 +1,118 @@
+# Example configuration for intervention-based GRPO training
+
+# Rollout configuration
+rollout:
+  # Use the new intervention rollout implementation
+  name: "vllm_intervention"
+  mode: "sync"
+
+  # Basic rollout parameters
+  prompt_length: 512
+  response_length: 512
+  max_model_len: 1024
+
+  # vLLM specific settings
+  tensor_model_parallel_size: 1
+  max_num_seqs: 256
+  max_num_batched_tokens: 8192
+  enable_chunked_prefill: true
+  gpu_memory_utilization: 0.9
+  enforce_eager: false
+  disable_log_stats: true
+  calculate_log_probs: true
+
+  # Enable intervention-based sampling
+  enable_intervention: true
+
+  # Intervention configuration
+  intervention:
+    # Stage 1: Generate 4 base trajectories
+    n_base_trajectories: 4
+
+    # Stage 2: Generate 3 interventions per base trajectory
+    n_interventions_per_base: 3
+
+    # Temperature settings
+    base_temperature: 1.2  # Higher for diverse base trajectories
+    intervention_temperature: 1.0  # Normal temperature for interventions
+
+    # Position to insert interventions (as fraction of response length)
+    min_intervention_position: 0.3  # Insert after at least 30% of response
+    max_intervention_position: 0.8  # Insert before 80% of response
+
+    # Custom intervention phrases (optional)
+    # If not specified, will use default phrases
+    # Based on actual model behaviors, categorized by type
+    intervention_phrases:
+      # Problem decomposition
+      - "Let me try to break this down step by step: "
+      - "Let me break this down step by step: "
+      - "Hmm, let me break this down step by step: "
+      - "Let me try to figure this out step by step: "
+      # Changing approach
+      - "Let me try to think differently: "
+      - "Maybe I need to think differently: "
+      - "Wait, let me think differently: "
+      - "Let me try a different approach: "
+      - "Let me try another approach: "
+      - "Maybe I need a different approach: "
+      # Verification/correction
+      - "Wait, no, that's not correct: "
+      - "Wait, that doesn't make sense: "
+      - "Wait, no, that can't be: "
+      - "Let me double-check this: "
+      - "Let me verify this: "
+      # Deep thinking
+      - "Hmm, let me think about how to approach this: "
+      - "Let me think about how to approach this: "
+      - "Wait, let me think again: "
+      - "Actually, let me think about this more: "
+      # Summarization
+      - "So, putting it all together: "
+      - "Thus, the final answer is: "
+      # Recording/expression
+      - "Let me write that down: "
+      - "Let me write this as: "
+      - "Let me write that out: "
+      # Uncertainty/questioning
+      - "But I'm not entirely sure: "
+      - "Wait, but I'm not sure: "
+      - "So, which one is correct: "
+      - "Hmm, not sure if that helps: "
+      # Backtracking/reconsidering
+      - "Wait, perhaps I made a mistake in the: "
+      - "Let me reconsider the: "
+
+  # Sampling parameters
+  temperature: 1.0  # Default temperature (overridden by intervention config)
+  top_p: 0.9
+  top_k: -1
+  repetition_penalty: 1.0
+
+  # Validation parameters (when not training)
+  val_kwargs:
+    temperature: 0.7
+    top_p: 0.9
+    top_k: 50
+
+# Model configuration
+model:
+  path: "path/to/your/model"
+  tokenizer: "path/to/tokenizer"
+  dtype: "bfloat16"
+  trust_remote_code: true
+
+# Training configuration
+training:
+  batch_size: 8  # Will generate 8 * 16 = 128 total trajectories
+  learning_rate: 1e-6
+  num_epochs: 3
+
+  # GRPO specific settings
+  grpo:
+    # Each batch will have:
+    # - 8 samples
+    # - 4 base trajectories per sample (with temperature 1.2)
+    # - 12 intervention trajectories per sample (3 per base, with temperature 1.0)
+    # Total: 8 * 16 = 128 trajectories per batch
+    use_intervention_diversity: true
